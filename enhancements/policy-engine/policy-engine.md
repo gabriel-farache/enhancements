@@ -159,8 +159,9 @@ sequenceDiagram
         PolicyEngine-->>User: Error response
     else Uniqueness check passed
         PolicyEngine->>PolicyEngine: Generate UUID
+        PolicyEngine->>PolicyEngine: Parse PackageName
         PolicyEngine->>Database: Store policy metadata
-        Note right of Database: UUID, Name, ServiceType,<br/>LabelSelector, Policy Type, Priority
+        Note right of Database: UUID, Name, PackageName,<br/>LabelSelector, Policy Type, Priority
         PolicyEngine->>OPA: Push REGO code with UUID
         alt REGO compilation failed
             OPA-->>PolicyEngine: Compilation error
@@ -185,7 +186,6 @@ sequenceDiagram
     - All tenant policies must have unique names within their tenant
     - All user policies must have unique names for their user
 - Policy Matching Criteria. Treated with AND.
-  - ServiceType
   - Label Selector
 - Policy Type
   - Global, Tenant, User
@@ -205,12 +205,14 @@ sequenceDiagram
 - Validate the Policy Name and Priority
   - If not unique return an error
 - Generate a UUID
+- Get the policy package name from the REGO code
 - Store the following information in the DB
   - UUID
   - Name
-  - Service Type
+  - Package Name
   - Policy Type
   - Priority
+  - Label Selector
 - Push the REGO code to OPA
   - Use the UUID for naming to avoid collisions
   - If failed, rollback DB and return an error
@@ -298,7 +300,7 @@ evaluation; it calls pre-loaded modules in OPA.
   return successfully
 - Iterate for each policy P:
   - Call `OPA`:
-    - Invoke data.dcm.policy.<P.id>.result
+    - Invoke /v1/data/<P.PackageName>/main
     - Pass
       - `CurrentRequestPayload`
       - `ConstraintContext`
