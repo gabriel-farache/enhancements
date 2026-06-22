@@ -105,14 +105,6 @@ Think broadly: security, UX, impact on the larger DCM ecosystem.
 Technical design details. Include diagrams if helpful.
 -->
 
-### Test Plan
-
-<!--
-If applicable, how will this be tested?
-- Will there be e2e and integration tests, in addition to unit tests?
-- How will it be tested in isolation vs with other components?
--->
-
 ### Upgrade / Downgrade Strategy
 
 <!--
