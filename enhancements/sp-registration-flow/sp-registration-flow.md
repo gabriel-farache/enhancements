@@ -17,6 +17,8 @@ approvers:
   - "@flocati"
   - "@gabriel-farache"
 creation-date: 2025-12-05
+see-also:
+  - "/enhancements/environment-agent/environment-agent.md"
 ---
 
 # Service Provider Registration Flow
@@ -26,19 +28,35 @@ creation-date: 2025-12-05
 The DCM (Data Center Management) is designed to provide a unified control plane
 for managing distributed infrastructure across multiple enclaves, including
 air-gapped environments, regional datacenters, and isolated security zones (e.g.
-ships, edge locations). A fundamental architectural decision must be made about
-how Service Providers (SP) — the components that execute infrastructure
-provisioning work — become known to and integrate with the DCM Control Plane.
-This decision directly impacts scalability, security, network topology,
-operational model (whether centralized DCM teams or distributed SME teams manage
-Service Provider lifecycle).
+ships, edge locations). In each target environment, an
+[Agent](../environment-agent/environment-agent.md) runs as the intermediary
+between DCM and the Service Providers (SPs) deployed in that environment.
+
+The Agent supports a hybrid SP model: it ships with embedded SP code for known
+service types (K8s Container, ACM Cluster, KubeVirt), enabled via configuration,
+and also accepts external ("bring your own") SPs that register via the Agent's
+SP Registration API (`POST /api/v1/providers`). Only one SP — embedded or
+external — may serve a given service type per agent; duplicate registrations are
+rejected with `409 Conflict`.
+
+This document defines the registration contract for external SPs — API shape,
+idempotency semantics, and natural key behavior. Embedded SPs register
+internally at agent startup without a REST call and do not use this flow.
+
+The Agent, in turn, registers itself to DCM via a separate API
+(`POST /api/v1/agents`), advertising the environment and the aggregated list of
+service types it can serve. DCM's Registration Handler no longer receives SP
+registrations directly; it receives Agent registrations. The Agent Registration
+Flow is defined in the
+[Environment Agent enhancement](../environment-agent/environment-agent.md#agent-registration-flow).
 
 ## Motivation
 
 ### Goals
 
-- Define the registration mechanism by which Service Providers become known to
-  and communicate with the DCM Control Plane.
+- Define the registration mechanism by which external Service Providers become
+  known to the Agent, and how the Agent becomes known to DCM.
+- Define the service type uniqueness constraint (one SP per service type).
 
 ### Non-Goals
 
@@ -48,6 +66,10 @@ Service Provider lifecycle).
 - DCM Control Plane definition
 - Meta-service-provider design
 - Service Provider's policies
+- Embedded SP registration (these register internally at agent startup; see the
+  [Environment Agent enhancement](../environment-agent/environment-agent.md#embedded-sp-registration))
+- Agent registration to DCM (defined in the
+  [Environment Agent enhancement](../environment-agent/environment-agent.md#agent-registration-flow))
 
 ## Proposal
 
@@ -55,36 +77,41 @@ Service Provider lifecycle).
 
 #### Terminology
 
-Service Providers must register using the DCM Service Provider API to operate
-within the DCM system. The Registration Handler component implements the
-provider registration endpoints of the Service Provider API. The registration
-phase provides to the DCM Control Plane the SP endpoint, metadata and
-capabilities so it can route requests to the appropriate SP. The registration
-call can be initiated either by the SP itself during start up phase or by a
-third party (e.g. platform admins) on behalf of the SP. Both approaches use the
-same registration API.
+External Service Providers must register using the Agent's SP Registration API
+to operate within the DCM system. The Agent implements the provider registration
+endpoint (`POST /api/v1/providers`), applying the same contract defined in this
+document. Embedded SPs (K8s Container, ACM Cluster, KubeVirt) register
+internally at agent startup and do not use this endpoint.
+
+The registration phase provides the Agent with the SP endpoint, metadata and
+capabilities so it can route creation requests to the appropriate SP. The
+registration call can be initiated either by the SP itself during start up phase
+or by a third party (e.g. platform admins) on behalf of the SP. Both approaches
+use the same registration API.
+
+Only one SP — embedded or external — may serve a given service type per agent.
+If the requested service type is already served by another SP (embedded or
+external), the Agent rejects the registration with `409 Conflict` (see the
+[Environment Agent enhancement](../environment-agent/environment-agent.md#sp-registration-to-agent)
+for the full service type uniqueness constraint).
 
 The _initial implementation_ will focus only on the **self registration flow**.
 
-The _Service Provider API_ is located in the Egress layer and defines the
-contract between the DCM Control Plane and Service Providers. It includes
-endpoints for provider registration, service management, and provider queries.
-The
+The _SP Registration API_ is hosted by the Agent and defines the contract
+between the Agent and Service Providers. It includes the endpoint for provider
+registration. The
 [Service Provider API specification](https://github.com/Fale/dcm/blob/od/api/interoperabilityAPI.yaml)
 is under development.
 
-Within this architecture, the _Registration Handler_ is a component within the
-Service Provider API that implements the provider registration endpoints
-(`POST /providers` and related endpoints). When an SP registers, the
-Registration Handler communicates with the Control Plane to update the Service
-Registry.
+DCM implements `POST /api/v1/agents` for Agent registration (defined in the
+[Environment Agent enhancement](../environment-agent/environment-agent.md#post-apiv1agents--agent-registration)).
 
 #### Architectural Assumptions
 
-Bidirectional network connectivity between Service Providers and the DCM Control
-Plane is required. SPs must reach DCM to register, and DCM must reach SPs to
-route provisioning requests. If either direction is blocked, the system cannot
-function regardless of the registration method used.
+SPs require network connectivity to the Agent. The Agent requires outbound
+connectivity to DCM (for registration and heartbeats) and to the Messaging
+System. DCM requires connectivity to the Messaging System. Direct SP-to-DCM
+connectivity is not required.
 
 #### Registration Flow
 
@@ -98,17 +125,18 @@ capability matrices.
 ```mermaid
 %%{init: {'flowchart': {'rankSpacing': 100, 'nodeSpacing': 10}}}%%
 flowchart BT
-    subgraph Data_Sources [**Data Sources**]
-        DB[("**Service Registry**<br/>SP endpoints")]
+    subgraph DCM_Control_Plane [**DCM Control Plane**]
+        DB[("**Agent Registry**<br/>Agent endpoints &<br/>service types")]
     end
 
-    subgraph API_Block [**Service Provider API**]
-        Handler["_Service Registration Handler_
+    subgraph Agent_Block [**Agent**]
+        Handler["_SP Registration Handler_
         2. Receive Request
-        3. Validate & Process"]
+        3. Validate & Process
+        4. Update internal SP registry"]
     end
 
-    subgraph Service_API [**Service API**<br/><br/> ]
+    subgraph Service_API [**Service Providers**<br/><br/> ]
 
         subgraph SP1 [**ServiceProvider 1**<br/>]
             VM_Prov["**VM Provider Impl.**
@@ -130,14 +158,14 @@ flowchart BT
     end
 
     VM_Prov & Storage_Prov & Container_Prov & Pod_Prov -- 1. Register --> Handler
-    Handler -- 4. Update Service Registry --> DB
+    Handler -- 5. Update DCM<br/>POST /api/v1/agents --> DB
 ```
 
 - Admins predefine supported
   [Service Types](https://github.com/dcm-project/enhancements/blob/main/enhancements/service-type-definitions/service-type-definitions.md)
   (e.g., "vm", "database")
-- A registration call must be made to the Registration Handler endpoint for each
-  service type the SP supports. The payload includes:
+- A registration call must be made to the Agent's SP Registration endpoint for
+  each service type the SP supports. The payload includes:
   1. Unique provider name
   2. Unique providerID (optional, server-generated if not provided)
   3. Endpoint URL (e.g.,
@@ -146,13 +174,17 @@ flowchart BT
   5. Metadata (optional: zone, region, resource constraints)
   6. Operations supported for this service type (optional, e.g., _"create"_,
      _"delete"_)
-- The Registration Handler processes and validates the metadata
-- The Registration Handler internally updates the Service Registry with:
-  1. SP endpoint
-  1. metadata
-- When user requests a catalog offering, Control Plane matches it to registered
-  SPs that can fulfill it based on configured policies and calls the selected SP
-  endpoint (endpoint must be reachable)
+- The Agent processes and validates the metadata
+- The Agent stores the SP registration in its internal registry and recomputes
+  its list of supported service types
+- When the Agent's service type list changes (new type added or removed), the
+  Agent updates DCM via `POST /api/v1/agents` (see the
+  [Environment Agent enhancement](../environment-agent/environment-agent.md#sp-registration-to-agent)
+  for the full flow)
+- When user requests a catalog offering, DCM's Control Plane matches it to a
+  registered Agent that can fulfill it based on configured policies and routes
+  the request through the messaging system to the Agent, which forwards it to
+  the selected SP
 
 The Service Provider's _name_ is the natural key used to match existing
 registrations.
@@ -163,18 +195,25 @@ request body. This allows the `id` field in the schema to be `readOnly`,
 preventing conflicts between query param and body values. The server sets `id`
 from the query parameter or auto-generates it if not provided.
 
-The registration endpoint is idempotent. During the registration phase:
+The registration endpoint is idempotent. These idempotency semantics apply at
+the Agent level for SP registration. During the registration phase:
 
-- If the _name_ does not exist in DCM, a new SP entry is created. If no
-  _providerID_ is specified, DCM will automatically generate one.
+- If the _name_ does not exist in the Agent's registry, a new SP entry is
+  created. If no _providerID_ is specified, the Agent will automatically
+  generate one.
 - If the _name_ already exists and no _providerID_ is provided (or the same
   _providerID_ is provided), the existing entry is updated and the same
   _providerID_ is returned.
 - If the _name_ already exists but a **different** _providerID_ is provided,
   registration fails (conflict: another SP is attempting to register with a
   taken name).
-- If a new _name_ is provided but the _providerID_ already exists in DCM,
-  registration fails (conflict: _providerID_ is already assigned to another SP).
+- If a new _name_ is provided but the _providerID_ already exists in the Agent's
+  registry, registration fails (conflict: _providerID_ is already assigned to
+  another SP).
+
+Identical idempotency semantics (same `name` natural key pattern) apply at DCM
+level for Agent registration, as defined in the
+[Environment Agent enhancement](../environment-agent/environment-agent.md#re-registration-on-restart).
 
 The response to a registration request will always include the _providerID_,
 regardless of whether it was generated or provided. Consistent with AEP, the
@@ -184,35 +223,37 @@ response payload mirrors the request payload with possibly updated values.
 
 The registration endpoint is idempotent. If an SP's capabilities change
 (typically due to a new version following a restart), the SP (or admin) can call
-the same registration endpoint again. The Registration Handler will update the
-existing SP entry rather than creating a duplicate.
+the same registration endpoint again. The Agent will update the existing SP
+entry rather than creating a duplicate.
+
+When an SP re-registers with updated capabilities, the Agent recomputes its
+service type list and, if changed, updates DCM via `POST /api/v1/agents`.
 
 - SP serviceType changes
-- SP restarts and re-registers using the same Service Provider API registration
-  endpoint
-- The Registration Handler updates the existing Service Provider Registry and
-  Service Catalog entry with the new serviceType
-- The Registration Handler detects that the SP already exists by matching the
-  Service Provider _name_
-- The Registration Handler updates the existing Service Registry entry with the
-  new serviceType and returns the same providerID.
-- There are 3 potential scenarios for updating a Service Provider within DCM:
+- SP restarts and re-registers using the same Agent SP Registration API endpoint
+- The Agent updates the existing SP entry in its internal registry with the new
+  serviceType
+- The Agent detects that the SP already exists by matching the Service Provider
+  _name_
+- The Agent updates the existing SP entry with the new serviceType and returns
+  the same providerID.
+- There are 3 potential scenarios for updating a Service Provider:
 
 1. SP's _name_ update: If only the SP's name changes (but the providerID remains
-   the same), DCM updates the SP's name. An attempt to update with a
+   the same), the Agent updates the SP's name. An attempt to update with a
    pre-existing SP's name will result in failure.
 2. _providerID_ update: If only the _providerID_ changes (but the SP's _name_
-   remains the same), DCM updates the providerID. An attempt to update with a
-   pre-existing _providerID_ will result in failure.
-3. Both the SP's name and providerID change: DCM cannot reliably determine if
-   this is an update to the existing SP or a new registration of a distinct SP.
-   In this scenario the required action is to delete and re-create the SP.
+   remains the same), the Agent updates the providerID. An attempt to update
+   with a pre-existing _providerID_ will result in failure.
+3. Both the SP's name and providerID change: The Agent cannot reliably determine
+   if this is an update to the existing SP or a new registration of a distinct
+   SP. In this scenario the required action is to delete and re-create the SP.
 
 ###### Example
 
 - First registration (with client-specified id):
 
-`POST /api/v1/providers?id=uuid-1234`
+`POST /api/v1/providers?id=uuid-1234` (on the Agent)
 
 ```yaml
 {
@@ -246,7 +287,7 @@ Response:
 
 - First registration (with server generated id):
 
-`POST /api/v1/providers`
+`POST /api/v1/providers` (on the Agent)
 
 ```yaml
 {
@@ -268,7 +309,7 @@ Response:
 
 - Re-registration (SP restarts, same endpoint):
 
-`POST /api/v1/providers`
+`POST /api/v1/providers` (on the Agent)
 
 ```yaml
 {
@@ -293,7 +334,22 @@ Response:
 
 ### Risks and Mitigations
 
+The risks related to the Agent-based architecture (agent as single point of
+failure, unauthenticated SP registration, messaging system dependencies) are
+documented in the
+[Environment Agent enhancement](../environment-agent/environment-agent.md#risks-and-mitigations).
+
+### Next Steps
+
+- HA agent replicas for high availability per environment
+- Authenticated SP registration (AuthN/AuthZ for the Agent's SP Registration
+  API)
+- Dynamic cost tier updates without agent restart
+
 ## Alternatives
+
+The following alternatives were evaluated before the current Agent-based
+architecture was adopted. They are retained for historical context.
 
 ### Dynamic Registration Approach
 
@@ -463,4 +519,7 @@ flowchart BT
 #### Why rejected
 
 Too complex for initial delivery. Requirements for network scanning, discovery
-protocols, and security policies are not yet defined.
+protocols, and security policies are not yet defined. The Agent-based
+architecture further reinforces this rejection: the Agent eliminates the need
+for direct DCM-to-SP connectivity, making a DCM-driven network scanning approach
+even less aligned with the current architecture.

@@ -13,14 +13,20 @@ reviewers:
 approvers:
   - TBD
 creation-date: 2025-12-15
+see-also:
+  - "/enhancements/environment-agent/environment-agent.md"
 ---
 
 # Policy API & Execution Engine
 
 ## Summary
 
-This ADR defines the Management and Execution API and Workflow of the DCM Policy
-Engine
+This enhancement defines the Management and Execution API and Workflow of the
+DCM Policy Engine.
+
+With the introduction of the Environment Agent layer, the Policy Engine selects
+an Agent (rather than a Service Provider) to handle the request, and can
+constrain selection by environment.
 
 ## Motivation
 
@@ -28,10 +34,9 @@ The Policy Engine operates as a specialized microservice within the Data Center
 Management (DCM) application responsible for governing service creation and
 modification (e.g., VirtualMachines, Containers). It enables Admins,
 Tenant-Admins, and Users to inject logic that validates (Approve/Reject),
-mutates (Defaulting/Altering) and assigns Service Providers to request payloads
-using an embedded
-[Open Policy Agent (OPA)](https://www.openpolicyagent.org/docs) engine and
-[Rego](https://www.openpolicyagent.org/docs/policy-language).
+mutates (Defaulting/Altering) and assigns Agents to request payloads using an
+embedded [Open Policy Agent (OPA)](https://www.openpolicyagent.org/docs) engine
+and [Rego](https://www.openpolicyagent.org/docs/policy-language).
 
 OPA is embedded as a Go library within the Policy Engine process rather than
 deployed as a separate sidecar service. Rego source code is persisted in the
@@ -75,7 +80,8 @@ Every policy may return one or more of the following outputs
    by providing a patch map.
 3. **Field Constraints:** Defining the mutability of fields for _subsequent_
    policies in the chain.
-4. **Service Provider Selection:** Policies may set a value and/or constraints
+4. **Agent Selection:** Policies may set a target agent and/or agent constraints
+   (including environment constraints)
 
 ### Policy Scope & Hierarchy (Execution Order)
 
@@ -100,10 +106,14 @@ The input payload includes:
     they will need to know the expected content
 - `constraints` - The current constraints context (accumulated from prior
   policies)
-- `provider` - The currently selected service provider (empty string initially,
-  populated as policies are evaluated)
-- `service_provider_constraints` - The current service provider constraints
-  (accumulated from prior policies)
+- `agent` - The currently selected agent (empty string initially, populated as
+  policies are evaluated)
+- `agent_constraints` - The current agent constraints (accumulated from prior
+  policies)
+- `available_agents` - List of eligible agents with metadata
+  `[{name, environment, serviceTypes, cost}]`, provided by Placement Manager
+- `exclude_agents` - List of agent names to exclude from selection (used during
+  re-evaluation after queued timeout)
 
 #### Output
 
@@ -113,11 +123,14 @@ following elements
 - **rejected** (bool) - since requests are approved by default, policies may
   reject them.
 - **rejection_reason** (string, optional) - reason for rejection
-- **selected_provider** (string, optional) - the name of the service provider
-  chosen to fulfill the request
-- **service_provider_constraints** (object, optional) -
-  - `allow_list` - list of allowed service provider names
-  - `patterns` - list of regex patterns for matching allowed providers
+- **selected_agent** (string, optional) - the name of the agent chosen to handle
+  the request
+- **agent_constraints** (object, optional) -
+  - `allow_list` - list of allowed agent names
+  - `patterns` - list of regex patterns for matching allowed agents
+  - `environment_constraints` - environment-level constraints
+    - `allow_list` - list of allowed environment identifiers
+    - `patterns` - list of regex patterns for matching allowed environments
 - **patch** (map, optional) - a dictionary of the corresponding service type for
   setting values. Each internal key is optional
 - **constraints** (map, optional) - follows
@@ -266,7 +279,7 @@ sequenceDiagram
     Database-->>PolicyEngine: List of policies
 
     loop For each policy
-        PolicyEngine->>PolicyEngine: Evaluate policy (embedded OPA)
+        PolicyEngine->>PolicyEngine: Evaluate policy (embedded OPA)<br/>{spec, agent, constraints, agent_constraints}
         PolicyEngine->>PolicyEngine: Enforce constraints
         PolicyEngine->>PolicyEngine: Mutate payload
         alt Policy rejected or constraint violation
@@ -275,7 +288,7 @@ sequenceDiagram
         end
     end
 
-    PolicyEngine-->>PlacementManager: Success with updated payload
+    PolicyEngine-->>PlacementManager: Success with {evaluatedServiceInstance, selectedAgent, status}
     PlacementManager-->>User: Service created
 ```
 
@@ -287,6 +300,10 @@ sequenceDiagram
 
 - Service Instance
   - spec - the service specification (flexible schema)
+- available_agents - list of agents with metadata (provided by PM)
+  `[{name, environment, serviceTypes, cost}]`
+- exclude_agents - list of agent names to exclude (optional, used for
+  re-evaluation)
 
 ###### Execution Logic & Flow
 
@@ -299,9 +316,11 @@ parallel with policy management operations.
 
 - The Policy API maintains a `ConstraintContext` map in memory for the duration
   of the request.
+- Pre-filter: Remove any agents in `exclude_agents` from the `available_agents`
+  list before evaluation begins.
 - Fetch & Sort:
   - Query DB for enabled policies matching the request payload based on the
-    policy’s matching criteria.
+    policy's matching criteria.
   - Sort by Level (Global -> Tenant -> User) then Priority (Desc).
 - If no policies matching the request payload were found, the request will
   return successfully
@@ -310,9 +329,11 @@ parallel with policy management operations.
     - Invoke the policy's package main rule
     - Pass
       - `spec` - the current patched request payload
-      - `provider` - the currently selected service provider
+      - `agent` - the currently selected agent
       - `constraints` - the accumulated constraint context (if any)
-      - `service_provider_constraints` - the accumulated SP constraints (if any)
+      - `agent_constraints` - the accumulated agent constraints (if any)
+      - `available_agents` - the pre-filtered list of eligible agents
+      - `exclude_agents` - the list of excluded agent names
   - Check `Reject`
     - If `Reject` is `true`, ABORT IMMEDIATELY (Fail Fast). Return 406.
   - Validate `Constraints`:
@@ -327,13 +348,16 @@ parallel with policy management operations.
       patch the `region`, ABORT with "Policy Conflict Error"
   - Apply `Patch`
     - Update service_payload with valid patches.
-  - Validate `ServiceProvider`
-    - If Policy P returned a `selected_provider` and
-      `service_provider_constraints` exist, validate the selected provider
-      against the constraints.
+  - Validate `Agent`
+    - If Policy P returned a `selected_agent` and `agent_constraints` exist,
+      validate the selected agent against the constraints.
+    - If `environment_constraints` exist, validate the selected agent's
+      environment against those constraints (Policy Engine uses
+      `available_agents` metadata for this).
 
-- Finalize: Return the final payload, selected provider, and status to Placement
+- Finalize: Return the final payload, selected agent, and status to Placement
   Manager.
+  - Response: `{evaluatedServiceInstance, selectedAgent, status}`
   - Status is `APPROVED` if the payload was not modified, `MODIFIED` if any
     patches were applied.
 
@@ -347,3 +371,24 @@ parallel with policy management operations.
   - Patch: {"billing_tag": "marketing"}
   - Action: Engine checks Context. billing_tag is immutable.
 - Result: Error. The User policy violates the Global constraint.
+
+###### _Agent/Environment Constraint Validation Example_
+
+- Step 1 (Global Policy):
+  - agent_constraints: {environment_constraints: {allow_list: ["prod-eu-west-1",
+    "prod-us-east-1"]}}
+  - Result: Only agents in prod-eu-west-1 or prod-us-east-1 are eligible
+- Step 2 (Tenant Policy):
+  - selected_agent: "prod-eu-agent"
+  - Validation: Agent's environment is "prod-eu-west-1" (looked up from
+    available_agents metadata) — matches allow_list. Valid.
+- Step 3 (User Policy):
+  - selected_agent: "dev-agent"
+  - Validation: Agent's environment is "dev" (looked up from available_agents
+    metadata) — NOT in allow_list. Error: violates Global constraint.
+
+## Next Steps
+
+- Cost-based agent selection within agent_constraints
+- Resource capacity constraints (totalCpu, totalMemory)
+- SP-level constraints passed through to agents

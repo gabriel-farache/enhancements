@@ -1239,17 +1239,6 @@ environment variable polling, or Kubernetes ConfigMap updates — and propagate
 them to DCM without downtime. Referenced in [Open Questions](#open-questions)
 (item 2).
 
-### DCM-Side Handling of Queued Requests (consolidation)
-
-When the agent holds a request because the SP for a given service type is
-unhealthy, it responds to DCM with a "queued" CloudEvent
-(`dcm.agent.request-queued`). The DCM Control Plane does not yet define how it
-surfaces this status to the end user, whether it applies a timeout, or whether
-it re-evaluates policies to re-route the request to a different
-agent/environment. A future iteration would formalize DCM's behavior for queued
-requests, including user visibility, timeout semantics, and potential re-routing
-strategies. Referenced in [Open Questions](#open-questions) (item 3).
-
 ### Multiple SPs per Service Type (consolidation)
 
 The current design enforces a one-SP-per-service-type constraint. A future

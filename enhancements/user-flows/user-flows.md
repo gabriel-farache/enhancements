@@ -15,13 +15,14 @@ see-also:
   - "/enhancements/kubevirt-sp/kubevirt-sp.md"
   - "/enhancements/k8s-container-sp/k8s-container-sp.md"
   - "/enhancements/acm-cluster-sp/acm-cluster-sp.md"
+  - "/enhancements/environment-agent/environment-agent.md"
 ---
 
 # DCM User Flows
 
 This document summarizes the primary user flows in the DCM system, covering
 policy management, service type and catalog item management, service provider
-lifecycle, and end-to-end CatalogItemInstance creation.
+and agent lifecycle, and end-to-end CatalogItemInstance creation and deletion.
 
 ## Table of Contents
 
@@ -35,16 +36,22 @@ lifecycle, and end-to-end CatalogItemInstance creation.
 - [4. Managing CatalogItems](#4-managing-catalogitems)
   - [4.1 Create CatalogItem](#41-create-catalogitem)
   - [4.2 CatalogItem to ServiceType Translation](#42-catalogitem-to-servicetype-translation)
-- [5. Service Provider Lifecycle](#5-service-provider-lifecycle)
-  - [5.1 Service Provider Registration](#51-service-provider-registration)
-  - [5.2 Service Provider Health Checks](#52-service-provider-health-checks)
-  - [5.3 Service Provider Status Reporting](#53-service-provider-status-reporting)
+- [5. Service Provider & Agent Lifecycle](#5-service-provider--agent-lifecycle)
+  - [5.1 Service Provider Registration (SP → Agent)](#51-service-provider-registration-sp--agent)
+  - [5.2 Agent Registration (Agent → DCM)](#52-agent-registration-agent--dcm)
+  - [5.3 Health Monitoring](#53-health-monitoring)
+    - [5.3.1 SP Health (Agent → SP)](#531-sp-health-agent--sp)
+    - [5.3.2 Agent Health (Agent → DCM heartbeats)](#532-agent-health-agent--dcm-heartbeats)
+    - [5.3.3 Consumer Lag Monitoring](#533-consumer-lag-monitoring)
+  - [5.4 Service Provider Status Reporting](#54-service-provider-status-reporting)
+  - [5.5 Agent Lifecycle](#55-agent-lifecycle)
 - [6. CatalogItemInstance Creation (End-to-End)](#6-catalogiteminstance-creation-end-to-end)
   - [6.1 Full Creation Flow](#61-full-creation-flow)
   - [6.2 Placement Manager Flow](#62-placement-manager-flow)
   - [6.3 SP Resource Manager Flow](#63-sp-resource-manager-flow)
   - [6.4 Service Provider Instance Creation](#64-service-provider-instance-creation)
   - [6.5 Continuous Status Reporting](#65-continuous-status-reporting)
+  - [6.6 Deletion Flow](#66-deletion-flow)
 
 ---
 
@@ -52,16 +59,17 @@ lifecycle, and end-to-end CatalogItemInstance creation.
 
 The DCM system is composed of the following core components:
 
-| Component                          | Responsibility                                                                                        |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| **Catalog Manager**                | Entry point for user requests; manages CatalogItems and CatalogItemInstances                          |
-| **Catalog DB**                     | Stores CatalogItems, CatalogItemInstances, and ServiceType definitions                                |
-| **Placement Manager**              | Orchestrates instance creation; coordinates policy evaluation and SP selection                        |
-| **Policy Manager (Policy Engine)** | Validates, mutates, and selects Service Providers via REGO policies and OPA                           |
-| **SP Resource Manager**            | Intermediary between Placement Manager and Service Providers; handles SP lookup and health validation |
-| **Service Registry**               | Stores Service Provider registration, endpoints, and metadata                                         |
-| **Service Providers**              | Execute infrastructure provisioning (KubeVirt SP, K8s Container SP, ACM Cluster SP)                   |
-| **Messaging System**               | Handles CloudEvents for asynchronous status reporting (NATS)                                          |
+| Component                          | Responsibility                                                                                                          |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **Catalog Manager**                | Entry point for user requests; manages CatalogItems and CatalogItemInstances                                            |
+| **Catalog DB**                     | Stores CatalogItems, CatalogItemInstances, and ServiceType definitions                                                  |
+| **Placement Manager**              | Orchestrates instance creation; coordinates policy evaluation and agent selection                                       |
+| **Policy Manager (Policy Engine)** | Validates, mutates, and selects Agents via REGO policies and OPA                                                        |
+| **SP Resource Manager**            | Intermediary between Placement Manager and Agents; publishes CloudEvents to agent topics; consumes responses            |
+| **Agent Registry**                 | Stores Agent registration data (name, environment, serviceTypes, topicName, cost, healthStatus)                         |
+| **Environment Agent**              | Runs in target environment; routes creation/deletion requests to SPs; monitors SP health; reports to DCM via heartbeats |
+| **Service Providers**              | Execute infrastructure provisioning (KubeVirt SP, K8s Container SP, ACM Cluster SP)                                     |
+| **Messaging System**               | Handles CloudEvents for asynchronous request delivery and status reporting (NATS)                                       |
 
 ```mermaid
 graph TB
@@ -72,10 +80,12 @@ graph TB
     PM[Placement Manager]
     POL[Policy Manager / OPA]
     SPRM[SP Resource Manager]
-    SR[(Service Registry)]
+    AR[(Agent Registry)]
     DB[(Placement DB)]
-    MSG[Messaging System / NATS]
+    MS[Messaging System / NATS]
 
+    AG1[Agent - Environment 1]
+    AG2[Agent - Environment 2]
     SP1[KubeVirt SP]
     SP2[K8s Container SP]
     SP3[ACM Cluster SP]
@@ -88,15 +98,22 @@ graph TB
     PM --> POL
     PM --> SPRM
     PM --> DB
-    SPRM --> SR
-    SPRM --> SP1
-    SPRM --> SP2
-    SPRM --> SP3
+    SPRM --> AR
+    SPRM -->|publish requests| MS
+    MS -->|deliver requests| AG1
+    MS -->|deliver requests| AG2
+    AG1 --> SP1
+    AG1 --> SP2
+    AG2 --> SP3
+    AG1 -.->|registration & heartbeat| DCM_API
+    AG2 -.->|registration & heartbeat| DCM_API
+    DCM_API[DCM API]
+    DCM_API --> AR
 
-    SP1 -->|status events| MSG
-    SP2 -->|status events| MSG
-    SP3 -->|status events| MSG
-    MSG -->|status updates| SPRM
+    SP1 -->|status events| MS
+    SP2 -->|status events| MS
+    SP3 -->|status events| MS
+    MS -->|status updates| SPRM
     SPRM -->|status updates| CM
 ```
 
@@ -104,9 +121,9 @@ graph TB
 
 ## 2. Managing Policies
 
-Policies control validation, mutation, and Service Provider selection for all
-resource requests. They are organized in a three-level hierarchy: **Global**
-(Super Admin), **Tenant** (Tenant Admin), and **User** (End User).
+Policies control validation, mutation, and Agent selection for all resource
+requests. They are organized in a three-level hierarchy: **Global** (Super
+Admin), **Tenant** (Tenant Admin), and **User** (End User).
 
 ### 2.1 Create Policy
 
@@ -154,10 +171,10 @@ sequenceDiagram
 ### 2.2 Policy Evaluation
 
 When a resource request arrives, the Policy Manager fetches all matching enabled
-policies, sorts them by level (Global → Tenant → User) then priority
+policies, sorts them by level (Global > Tenant > User) then priority
 (ascending), and evaluates them in a chain-of-responsibility pipeline. Each
 policy can reject the request, apply patches (mutations), set constraints, and
-influence Service Provider selection.
+influence Agent selection.
 
 ```mermaid
 sequenceDiagram
@@ -166,14 +183,14 @@ sequenceDiagram
     participant DB as Policy DB
     participant OPA as OPA Engine
 
-    PM->>PE: POST /api/v1alpha1/policies:evaluateRequest<br/>{service_instance: {spec}}
+    PM->>PE: POST /api/v1alpha1/policies:evaluateRequest<br/>{service_instance: {spec}, available_agents}
 
     PE->>DB: Fetch enabled policies matching request via label selector
     PE->>PE: Sort by Level (Global→Tenant→User), then Priority (asc)
 
     loop For each policy in sorted order
-        PE->>OPA: Evaluate policy with:<br/>{spec, provider, constraints, service_provider_constraints}
-        OPA-->>PE: {rejected, patch, constraints,<br/>selected_provider, service_provider_constraints}
+        PE->>OPA: Evaluate policy with:<br/>{spec, agent, constraints, agent_constraints}
+        OPA-->>PE: {rejected, patch, constraints,<br/>selected_agent, agent_constraints}
 
         alt rejected == true
             PE-->>PM: 406 Not Acceptable (rejection_reason)
@@ -185,12 +202,12 @@ sequenceDiagram
         end
 
         PE->>PE: Merge constraints into ConstraintContext
-        PE->>PE: Merge service_provider_constraints
+        PE->>PE: Merge agent_constraints
         PE->>PE: Validate & apply patches against constraints
-        PE->>PE: Validate selected_provider against SP constraints
+        PE->>PE: Validate selected_agent against agent constraints
     end
 
-    PE-->>PM: 200 OK {evaluatedServiceInstance, selectedProvider, status}
+    PE-->>PM: 200 OK {evaluatedServiceInstance, selectedAgent, status}
 ```
 
 **Evaluation request (Placement Manager → Policy Manager):**
@@ -205,7 +222,21 @@ sequenceDiagram
       "guestOS": { "type": "fedora-39" },
       "metadata": { "name": "fedora-vm" }
     }
-  }
+  },
+  "available_agents": [
+    {
+      "name": "agent-prod-eu-west-1",
+      "environment": "prod-eu-west-1",
+      "serviceTypes": ["vm", "container"],
+      "cost": "medium"
+    },
+    {
+      "name": "agent-dev-us-east-1",
+      "environment": "dev-us-east-1",
+      "serviceTypes": ["vm"],
+      "cost": "low"
+    }
+  ]
 }
 ```
 
@@ -220,9 +251,18 @@ sequenceDiagram
     "guestOS": { "type": "fedora-39" },
     "metadata": { "name": "fedora-vm" }
   },
-  "provider": "",
+  "agent": "",
   "constraints": {},
-  "service_provider_constraints": {}
+  "agent_constraints": {},
+  "available_agents": [
+    {
+      "name": "prod-eu-agent",
+      "environment": "prod-eu-west-1",
+      "serviceTypes": ["vm", "database"],
+      "cost": "medium"
+    }
+  ],
+  "exclude_agents": []
 }
 ```
 
@@ -240,10 +280,13 @@ sequenceDiagram
     "region": { "const": "us-east-1" },
     "vcpu": { "minimum": 2, "maximum": 8 }
   },
-  "selected_provider": "kubevirt-sp",
-  "service_provider_constraints": {
-    "allow_list": ["kubevirt-sp", "vmware-sp"],
-    "patterns": []
+  "selected_agent": "agent-prod-eu-west-1",
+  "agent_constraints": {
+    "allow_list": ["agent-prod-eu-west-1", "agent-staging-eu-west-1"],
+    "patterns": [],
+    "environment_constraints": {
+      "allow_list": ["prod-eu-west-1", "staging-eu-west-1"]
+    }
   }
 }
 ```
@@ -253,7 +296,7 @@ sequenceDiagram
 ```json
 {
   "evaluatedServiceInstance": { "...": "final mutated spec" },
-  "selectedProvider": "kubevirt-sp",
+  "selectedAgent": "agent-prod-eu-west-1",
   "status": "APPROVED | MODIFIED"
 }
 ```
@@ -431,32 +474,59 @@ sequenceDiagram
 
 ---
 
-## 5. Service Provider Lifecycle
+## 5. Service Provider & Agent Lifecycle
 
-### 5.1 Service Provider Registration
+Service Providers register with the Environment Agent in their target
+environment. The Agent registers with DCM and acts as the intermediary for
+resource operation requests. For full details on agent behavior, see the
+[Environment Agent enhancement](/enhancements/environment-agent/environment-agent.md).
 
-Service Providers register with DCM per service type. Registration is idempotent
-— re-registering with the same name updates the existing entry.
+### 5.1 Service Provider Registration (SP → Agent)
+
+The Agent supports a hybrid SP model: it ships with embedded SP code for known
+service types (K8s Container, ACM Cluster, KubeVirt), enabled via configuration,
+and also accepts external ("bring your own") SPs that register via the REST API.
+Only one SP — embedded or external — may serve a given service type per agent;
+duplicate registrations are rejected with `409 Conflict`. Embedded SPs register
+internally at agent startup; external SPs register via `POST /api/v1/providers`.
+Registration is idempotent — re-registering with the same name updates the
+existing entry. External SPs periodically re-register to maintain their lease,
+which also ensures that after an agent restart, SPs naturally rebuild the
+agent's state.
 
 ```mermaid
 sequenceDiagram
     participant SP as Service Provider
-    participant SR as Service Registry
+    participant AG as Agent
+    participant DCM as DCM Control Plane
+    participant DB as Database
 
-    SP->>SR: POST /api/v1/providers<br/>{name, displayName, endpoint, serviceType, metadata}
+    Note over AG: Embedded SPs registered<br/>internally at startup
 
-    alt Name does not exist
-        SR->>SR: Create new SP entry, generate providerID
-        SR-->>SP: 201 Created {id, name, status: "registered"}
+    SP->>AG: POST /api/v1/providers<br/>{name, displayName, endpoint, serviceType, metadata}
+
+    alt Service type already served by another SP
+        AG-->>SP: 409 Conflict<br/>{error: "service type X already served by provider Y"}
+    else Name does not exist
+        AG->>AG: Create new SP entry, generate providerID
+        AG-->>SP: 201 Created {id, name, status: "registered"}
     else Name exists, same providerID
-        SR->>SR: Update existing entry
-        SR-->>SP: 200 OK {id, name, status: "registered"}
+        AG->>AG: Update existing entry
+        AG-->>SP: 200 OK {id, name, status: "registered"}
     else Name exists, different providerID
-        SR-->>SP: 409 Conflict
+        AG-->>SP: 409 Conflict
     end
+
+    alt Service type list changed AND agent registered to DCM
+        AG->>DCM: POST /api/v1/agents<br/>{name, environment, serviceTypes, cost, topicName}
+        DCM->>DB: Update agent registration
+        DCM-->>AG: 200 OK
+    end
+
+    Note over SP,AG: SP periodically re-registers<br/>to maintain lease
 ```
 
-**Registration payload example:**
+**Registration payload example (SP → Agent):**
 
 ```json
 {
@@ -475,47 +545,154 @@ sequenceDiagram
 }
 ```
 
-### 5.2 Service Provider Health Checks
+### 5.2 Agent Registration (Agent → DCM)
 
-DCM polls each registered Service Provider's `/health` endpoint at a
-configurable interval (default: every 10 seconds). Health status determines
-whether a provider can receive new requests.
-
-#### Health State Diagram
-
-```mermaid
-stateDiagram-v2
-    [*] --> Ready: Registered
-
-    Ready --> FailureCount: Failed
-    FailureCount --> Ready: OK (reset)
-    FailureCount --> NotReady: Threshold reached
-    NotReady --> Ready: OK (recover)
-```
-
-#### Health Check Sequence Diagram
+The Agent registers with DCM after creating its messaging topics and after at
+least one SP (embedded or external) is registered and healthy. Registration is
+idempotent — the agent `name` is the natural key. On restart, the agent
+re-registers; DCM resets the heartbeat tracker. For full registration details,
+see the
+[Environment Agent enhancement](/enhancements/environment-agent/environment-agent.md).
 
 ```mermaid
 sequenceDiagram
-    participant DCM as DCM Health Checker
+    autonumber
+    participant AG as Agent
+    participant MS as Messaging System
+    participant DCM as DCM Control Plane
+    participant DB as Database
+
+    AG->>MS: Create topics (main + retry)
+    Note over AG: Wait for at least 1 SP<br/>(embedded or external) to register<br/>and be healthy
+
+    AG->>DCM: POST /api/v1/agents<br/>{name, environment, serviceTypes,<br/>resourcesAvailable, cost, topicName}
+    DCM->>DB: Store agent registration
+    DCM-->>AG: 201 Created {agentId}
+```
+
+**Registration payload (Agent → DCM):**
+
+```json
+{
+  "name": "agent-prod-eu-west-1",
+  "environment": "prod-eu-west-1",
+  "serviceTypes": ["vm", "container"],
+  "resourcesAvailable": {
+    "totalCpu": 200,
+    "totalMemory": "1TB",
+    "totalStorage": "2TB"
+  },
+  "cost": "medium",
+  "topicName": "dcm.agents.agent-prod-eu-west-1"
+}
+```
+
+### 5.3 Health Monitoring
+
+#### 5.3.1 SP Health (Agent → SP)
+
+The Agent monitors each registered SP's health using a three-state model. The
+monitoring mechanism differs by SP type: embedded SPs are checked in-process (no
+network call), while external SPs are checked by polling their `/health`
+endpoint at a configurable interval.
+
+##### Health State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: Registered with Agent
+
+    Ready --> FailureCount: Failed
+    FailureCount --> Ready: OK (reset)
+    FailureCount --> Unavailable: Threshold reached
+
+    Ready --> Unhealthy: status: unhealthy
+    Unhealthy --> Ready: status: healthy
+    Unhealthy --> Unavailable: Timeout/error threshold
+
+    Unavailable --> Ready: OK (recover)
+```
+
+Three health states:
+
+- **Ready**: SP is healthy and eligible for routing.
+- **Unhealthy**: SP is reachable but reports its backing provider is down. The
+  Agent keeps the service type in its advertised list but stops routing requests
+  to this SP; incoming requests are held in the retry topic until the SP
+  recovers or becomes Unavailable.
+- **Unavailable**: SP is unreachable after exceeding the failure threshold. The
+  Agent removes the service type from its advertised list and updates DCM.
+
+##### Health Check Sequence
+
+```mermaid
+sequenceDiagram
+    participant AG as Agent
     participant SP as Service Provider
 
-    loop Every 10 seconds
-        DCM->>SP: GET /health
-        alt HTTP 200 OK
-            SP-->>DCM: 200 {status: "pass"}
-            DCM->>DCM: Reset failure counter, mark Ready
-        else Timeout or non-200
-            SP-->>DCM: Error / Timeout
-            DCM->>DCM: Increment failure counter
+    loop Every {healthCheckInterval} seconds
+        AG->>SP: GET /health
+        alt 200 OK, status: healthy
+            SP-->>AG: {status: "healthy"}
+            AG->>AG: Reset failure counter, mark Ready
+        else 200 OK, status: unhealthy
+            SP-->>AG: {status: "unhealthy"}
+            AG->>AG: Mark Unhealthy<br/>Stop routing, hold requests
+        else Timeout or error
+            SP-->>AG: Error / Timeout
+            AG->>AG: Increment failure counter
             alt Failures >= threshold
-                DCM->>DCM: Mark NotReady
+                AG->>AG: Mark Unavailable<br/>Remove service type, update DCM
             end
         end
     end
 ```
 
-### 5.3 Service Provider Status Reporting
+#### 5.3.2 Agent Health (Agent → DCM heartbeats)
+
+The Agent reports its own liveness to DCM via periodic REST heartbeats. DCM
+tracks the last heartbeat timestamp for each agent and marks the agent as
+Unavailable if no heartbeat is received within a configurable threshold.
+
+```mermaid
+sequenceDiagram
+    participant AG as Agent
+    participant DCM as DCM Control Plane
+
+    loop Every {heartbeatInterval} seconds
+        AG->>DCM: PUT /api/v1/agents/{agentId}/heartbeat<br/>{timestamp, consumerLag}
+        DCM->>DCM: Update heartbeat, check lag
+        DCM-->>AG: 200 OK
+    end
+
+    Note over DCM: No heartbeat within threshold
+    DCM->>DCM: Mark agent Unavailable
+```
+
+#### 5.3.3 Consumer Lag Monitoring
+
+The Agent self-reports its consumer lag in each heartbeat. If the lag exceeds
+`consumerLagThreshold`, DCM marks the agent as **Congested** and stops routing
+new requests to it. When the lag drops below the threshold, the Congested state
+is cleared.
+
+##### Agent Health State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: Agent registers
+    Ready --> Congested: lag >= threshold
+    Congested --> Ready: lag < threshold
+    Ready --> Unavailable: Heartbeat timeout
+    Congested --> Unavailable: Heartbeat timeout
+    Unavailable --> Ready: Agent re-registers
+```
+
+### 5.4 Service Provider Status Reporting
+
+> **Note:** Status reporting is not impacted by the Agent layer. SPs publish
+> status CloudEvents directly to the Messaging System. The Agent is not in the
+> status-reporting path.
 
 Service Providers report instance status changes to DCM via CloudEvents
 published to a messaging system (NATS). This decoupled approach supports
@@ -525,16 +702,16 @@ multiple consumers (billing, auditing, etc.) and scales independently.
 sequenceDiagram
     participant Platform as Underlying Platform<br/>(K8s, KubeVirt, ACM)
     participant SP as Service Provider
-    participant MSG as Messaging System (NATS)
+    participant MS as Messaging System (NATS)
     participant DCM as DCM Core Service
     participant DB as Status DB
 
     Platform->>SP: State change event<br/>(via informer watch or polling)
     SP->>SP: Map platform status → DCM status
     SP->>SP: Build CloudEvent
-    SP->>MSG: Publish to:<br/>dcm.providers.{provider}.{serviceType}<br/>.instances.{instanceId}.status
+    SP->>MS: Publish to:<br/>dcm.providers.{provider}.{serviceType}<br/>.instances.{instanceId}.status
 
-    MSG->>DCM: Deliver event
+    MS->>DCM: Deliver event
     DCM->>DCM: Validate CloudEvent schema
     alt Valid
         DCM->>DB: UPSERT instance status
@@ -555,14 +732,39 @@ sequenceDiagram
 | DELETING     |           |          |
 | DELETED      |           |          |
 
+### 5.5 Agent Lifecycle
+
+This section provides a brief overview of the agent lifecycle. For full details,
+see the
+[Environment Agent enhancement](/enhancements/environment-agent/environment-agent.md).
+
+**Startup:**
+
+1. Agent registers its configured embedded SPs internally (K8s Container, ACM
+   Cluster, KubeVirt — each if enabled in config)
+2. Agent creates messaging topics (main topic + retry topic)
+3. Agent waits for at least one SP (embedded or external) to be registered and
+   healthy
+4. Agent registers with DCM via `POST /api/v1/agents`
+5. Agent begins periodic heartbeats and SP health checking
+
+**Restart:**
+
+1. Agent re-registers with DCM (idempotent; DCM resets heartbeat tracker)
+2. Embedded SPs register internally at startup; external SPs naturally
+   re-register via periodic lease renewal, rebuilding agent state
+3. Unconsumed messages on both main and retry topics survive (messaging system
+   persistence)
+4. Agent resumes consuming from both topics once fully initialized
+
 ---
 
 ## 6. CatalogItemInstance Creation (End-to-End)
 
 This is the primary user flow: creating an infrastructure resource from a
 CatalogItem. The request flows through the Catalog Manager, Placement Manager
-(with policy evaluation), SP Resource Manager, and finally to the selected
-Service Provider.
+(with policy evaluation), SP Resource Manager (which publishes to the messaging
+system), the Environment Agent, and finally to the selected Service Provider.
 
 ### 6.1 Full Creation Flow
 
@@ -574,21 +776,22 @@ sequenceDiagram
     participant DB as Placement DB
     participant PE as Policy Manager
     participant SPRM as SP Resource Manager
-    participant SR as Service Registry
+    participant AR as Agent Registry
+    participant MS as Messaging System
+    participant AG as Agent
     participant SP as Service Provider
-    participant MSG as Messaging System
 
     User->>CM: Request CatalogItemInstance<br/>(select CatalogItem + customize fields)
     CM->>CM: Validate input, merge with defaults
     CM->>PM: POST /api/v1/resources<br/>{CatalogItemInstance: UUID, spec}
 
-    %% Intent preservation
     PM->>DB: Store original request (intent)
 
-    %% Policy evaluation
-    PM->>PE: POST /api/v1alpha1/policies:evaluateRequest<br/>{service_instance: {spec}}
-    PE->>PE: Fetch & sort matching policies<br/>(Global→Tenant→User, by priority)
-    PE->>PE: Evaluate policy chain<br/>(validate, mutate, select SP)
+    PM->>AR: Fetch available agents<br/>(healthy, not Congested, matching serviceType)
+    AR-->>PM: available_agents list
+
+    PM->>PE: POST /api/v1alpha1/policies:evaluateRequest<br/>{service_instance: {spec}, available_agents}
+    PE->>PE: Evaluate policy chain<br/>(validate, mutate, select Agent)
 
     alt Policy rejects
         PE-->>PM: 406 Not Acceptable
@@ -597,64 +800,87 @@ sequenceDiagram
         CM-->>User: Request denied
     end
 
-    PE-->>PM: 200 OK<br/>{evaluatedServiceInstance, selectedProvider, status}
-    PM->>DB: Store validated request
+    PE-->>PM: 200 OK<br/>{evaluatedServiceInstance, selectedAgent, status}
+    PM->>DB: Store validated request with agentName
 
-    %% SP Resource Manager
-    PM->>SPRM: POST /api/v1/service-type-instances<br/>{providerName, spec}
+    PM->>SPRM: POST /api/v1/service-type-instances<br/>{agentName, serviceType, spec}
 
-    SPRM->>SR: Lookup provider by name
-    alt Provider not found
-        SR-->>SPRM: 404
-        SPRM-->>PM: 404 Not Found
+    SPRM->>AR: Lookup agent, get topicName
+    alt Agent not found or unhealthy/Congested
+        SPRM-->>PM: Error (404/503)
         PM->>DB: Delete records
         PM-->>CM: Error
-        CM-->>User: Provider not found
-    end
-    SR-->>SPRM: {endpoint, metadata, healthStatus}
-
-    alt Provider unhealthy
-        SPRM-->>PM: 503 Service Unavailable
-        PM->>DB: Delete records
-        PM-->>CM: Error
-        CM-->>User: Provider unavailable
+        CM-->>User: Agent unavailable
     end
 
-    %% Instance creation
-    SPRM->>SP: POST {endpoint}/api/v1/{serviceType}<br/>{spec}
-    SP->>SP: Create resource on platform
-    SP-->>SPRM: {instanceId, status: PROVISIONING}
-    SPRM->>DB: Persist instance metadata
-    SPRM-->>PM: 202 Accepted {instanceId, status}
-    PM-->>CM: 202 Accepted
-    CM-->>User: Instance created<br/>{instanceId, status: PROVISIONING}
+    SPRM->>MS: PUBLISH CloudEvent<br/>topic: {topicName}<br/>{resourceId, serviceType, spec}
+    SPRM->>DB: Create instance record
+    SPRM-->>PM: 202 Accepted {instanceId, agentName, status: PENDING}
+    PM-->>CM: 201 Created
+    CM-->>User: Instance created (PENDING)
 
-    %% Continuous status reporting
-    Note over SP,MSG: Async status reporting begins
-    SP->>MSG: Publish status CloudEvents<br/>as instance state changes
-    MSG->>PM: Deliver status updates
-    PM->>DB: UPSERT status
+    Note over MS,AG: Async processing
+    MS->>AG: Deliver creation request
+    AG->>AG: Validate service type, select SP
+    AG->>SP: POST {spEndpoint}/api/v1/{serviceType}<br/>{spec}
+    SP-->>AG: {instanceId, status: PROVISIONING}
+    AG->>MS: PUBLISH CloudEvent<br/>topic: dcm.agents.responses<br/>{resourceId, agentName, topicName,<br/>status: PROVISIONING}
+    MS->>SPRM: Deliver response
+    SPRM->>DB: Update instance: PROVISIONING
+
+    opt Agent queues request (SP Unhealthy)
+        AG->>MS: PUBLISH CloudEvent<br/>topic: dcm.agents.responses<br/>{resourceId, status: QUEUED}
+        MS->>SPRM: Deliver QUEUED response
+        SPRM->>SPRM: Update instance: QUEUED
+        SPRM->>PM: Notify: instance QUEUED
+
+        Note over PM: Start queuedRequestTimeout
+        alt Timeout or timeout = 0
+            PM->>SPRM: DELETE instance
+            PM->>PE: Re-evaluate excluding agent
+            Note over PM: Route to alternative agent<br/>or return error if none available
+        end
+    end
+
+    Note over SP,MS: Status reporting (unchanged)
+    SP->>MS: Publish status CloudEvents
+    MS->>SPRM: Deliver status updates
 ```
+
+When the SP for the requested service type on the agent is Unhealthy, the Agent
+holds the request in its retry topic and responds with a QUEUED CloudEvent. DCM
+records the QUEUED status. If the SP recovers, the Agent processes the held
+request. If the SP becomes Unavailable, the Agent rejects the held request with
+an error CloudEvent. The Placement Manager handles the QUEUED status via a
+`queuedRequestTimeout` timer (see
+[6.2 Placement Manager Flow](#62-placement-manager-flow)).
 
 ### 6.2 Placement Manager Flow
 
 The Placement Manager is the central orchestrator. It preserves the user's
-original intent, delegates policy evaluation, and coordinates with the SP
-Resource Manager.
+original intent, fetches available agents, delegates policy evaluation, and
+coordinates with the SP Resource Manager.
 
 ```mermaid
 flowchart TD
     A[Receive request from Catalog Manager] --> B[Store original request in Placement DB]
-    B --> C[Send to Policy Manager for evaluation]
-    C --> D{Policy approved?}
-    D -->|No| E[Delete intent record]
-    E --> F[Return error to Catalog Manager]
-    D -->|Yes| G[Store validated request in Placement DB]
-    G --> H[Forward to SP Resource Manager<br/>with providerName and validated spec]
-    H --> I{SP Resource Manager<br/>succeeded?}
-    I -->|No| J[Delete records from Placement DB]
-    J --> F
-    I -->|Yes| K[Return 202 Accepted<br/>to Catalog Manager]
+    B --> C[Fetch available agents from Agent Registry]
+    C --> D[Send to Policy Manager for evaluation<br/>with available_agents]
+    D --> E{Policy approved?}
+    E -->|No| F[Delete intent record]
+    F --> G[Return error to Catalog Manager]
+    E -->|Yes| H[Store validated request with agentName]
+    H --> I[Forward to SP Resource Manager<br/>with agentName, serviceType, spec]
+    I --> J{SPRM response?}
+    J -->|Error| K[Delete records from Placement DB]
+    K --> G
+    J -->|202 Accepted| L[Return 201 Created<br/>to Catalog Manager]
+    J -->|QUEUED| M[Start queuedRequestTimeout timer]
+    M --> N{Timeout?}
+    N -->|Yes| O[Send DELETE to SPRM<br/>Re-evaluate excluding agent]
+    O --> P{Alternative agent?}
+    P -->|Yes| I
+    P -->|No| K
 ```
 
 **Request payload (Catalog Manager → Placement Manager):**
@@ -679,36 +905,38 @@ flowchart TD
 {
   "CatalogItemInstanceId": "f3645f8f-82c1-4efb-888f-318c0ac81a08",
   "resource_name": "fedora-vm",
-  "providerName": "kubevirt-sp",
+  "agentName": "agent-prod-eu-west-1",
   "id": "08aa81d1-a0d2-4d5f-a4df-b80addf07781"
 }
 ```
 
 ### 6.3 SP Resource Manager Flow
 
-The SP Resource Manager handles Service Provider lookup, health validation, and
-instance creation delegation.
+The SP Resource Manager handles Agent lookup and publishes creation requests as
+CloudEvents to the agent's messaging topic. It no longer calls SP REST endpoints
+directly.
 
 ```mermaid
 flowchart TD
-    A[Receive request from Placement Manager<br/>providerName + spec] --> B[Query Service Registry<br/>by providerName]
-    B --> C{Provider found?}
+    A[Receive request from Placement Manager<br/>agentName + serviceType + spec] --> B[Query Agent Registry<br/>by agentName]
+    B --> C{Agent found?}
     C -->|No| D[Return 404 Not Found]
-    C -->|Yes| E{Provider healthy?}
+    C -->|Yes| E{Agent healthy<br/>and not Congested?}
     E -->|No| F[Return 503 Service Unavailable]
-    E -->|Yes| G[Forward spec to Service Provider<br/>POST endpoint/api/v1/serviceType]
-    G --> H{SP creation succeeded?}
-    H -->|No| I[Forward error to Placement Manager]
-    H -->|Yes| J[Persist instance in database<br/>instanceId, providerName, metadata]
-    J --> K{DB persist succeeded?}
-    K -->|No| L[Return 500 Internal Server Error]
-    K -->|Yes| M[Return 202 Accepted<br/>instanceId, status]
+    E -->|Yes| G[Publish CloudEvent to agent topic<br/>via Messaging System]
+    G --> H[Create instance record in DB]
+    H --> I[Return 202 Accepted<br/>instanceId, agentName, status: PENDING]
 ```
 
 ### 6.4 Service Provider Instance Creation
 
 Each Service Provider translates the provider-agnostic ServiceType spec into
 platform-native resources.
+
+> **Note:** Each service type is served by exactly one SP (embedded or external)
+> per agent — there is no SP selection strategy. The Agent forwards the request
+> to the SP via an in-process call (for embedded SPs) or via REST (for external
+> SPs). The SP's internal behavior is unchanged.
 
 ```mermaid
 flowchart LR
@@ -729,6 +957,10 @@ flowchart LR
 ```
 
 ### 6.5 Continuous Status Reporting
+
+> **Note:** Status reporting is not impacted by the Agent layer. SPs publish
+> status CloudEvents directly to the Messaging System, bypassing the Agent. This
+> path is unchanged from the pre-agent architecture.
 
 After instance creation, Service Providers continuously monitor the underlying
 platform and report status changes via CloudEvents.
@@ -830,4 +1062,52 @@ graph LR
     HC3 --> DC3
     HC4 --> DC4
     HC5 --> DC5
+```
+
+### 6.6 Deletion Flow
+
+The deletion flow follows the same architecture as creation: the request is
+published as a CloudEvent to the agent's messaging topic, and the Agent routes
+it to the appropriate SP.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CM as Catalog Manager
+    participant PM as Placement Manager
+    participant DB as Placement DB
+    participant SPRM as SP Resource Manager
+    participant MS as Messaging System
+    participant AG as Agent
+    participant SP as Service Provider
+
+    User->>CM: Delete CatalogItemInstance
+    CM->>PM: DELETE /api/v1/resources/{resourceId}
+    PM->>DB: Lookup resource (agentName, serviceType, instanceId)
+
+    PM->>SPRM: DELETE /api/v1/service-type-instances/{instanceId}
+    SPRM->>MS: PUBLISH CloudEvent<br/>topic: {topicName}<br/>type: dcm.request.delete<br/>{resourceId, serviceType}
+    SPRM-->>PM: 202 Accepted
+
+    MS->>AG: Deliver deletion request
+    AG->>SP: DELETE {spEndpoint}/api/v1/{serviceType}/{resourceId}
+    SP-->>AG: {status: DELETING}
+    AG->>MS: PUBLISH CloudEvent<br/>topic: dcm.agents.responses<br/>{resourceId, agentName, topicName,<br/>status: DELETING}
+
+    opt Agent queues request (SP Unhealthy)
+        AG->>MS: PUBLISH CloudEvent<br/>topic: dcm.agents.responses<br/>{resourceId, status: QUEUED}
+        MS->>SPRM: Deliver QUEUED response
+        SPRM->>SPRM: Update instance: QUEUED
+        SPRM->>PM: Notify: deletion QUEUED
+
+        Note over PM: Start queuedRequestTimeout.<br/>Deletion cannot be re-routed<br/>to a different agent.
+        alt queuedRequestTimeout expires
+            PM-->>CM: Error: deletion failed<br/>(agent SP unavailable)
+        end
+    end
+
+    Note over SP: SP manages deletion<br/>and reports final status
+    SP->>MS: CloudEvent {status: DELETED}
+    MS->>SPRM: Status update
+    SPRM->>DB: Update status: DELETED
 ```
