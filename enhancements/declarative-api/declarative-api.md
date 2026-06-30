@@ -68,8 +68,8 @@ are created and when.
 - Each application run targets one placement context (no per-resource
   environment choice or cross-environment checks).
 - Dependent resources are provisioned in DAG order only. Placement/Policy does
-  not validate that assigned service providers are network reachable across
-  providers until environment based placement is introduced.
+  not validate that assigned agents are network reachable across environments
+  until environment based placement is introduced.
 
 ### Overview
 
@@ -116,14 +116,15 @@ flowchart TD
 
         PE["<b>Policy</b><br/>Validate per resource<br/>"]:::policyEngine
 
-        SPRM["<b>Service Provider Resource(SPR)</b><br/>Status queue consumer<br/>Dispatch request to Service Provider"]:::spResource
+        SPRM["<b>Service Provider Resource(SPR)</b><br/>Status queue consumer<br/>Publish request to Agent topic"]:::spResource
 
         DB[("<b>DCM DB</b><br/>Persist resource graph")]:::database
 
         ProvQ(("<b>Status queue</b><br/>Persist status messages")):::messaging
     end
 
-    SP["<b>Service Provider</b><br/>Process request from SPRM<br/>"]:::provider
+    MS["<b>Messaging System</b><br/>(NATS)"]:::messaging
+    AG["<b>Agent</b><br/>Route to Service Provider"]:::provider
 
     U --> CM
     CM --> PM
@@ -132,7 +133,8 @@ flowchart TD
     PM --> DB
 
     PM --> SPRM
-    SPRM --> SP
+    SPRM --> MS
+    MS --> AG
     ProvQ --> SPRM
 
     class DCM_Core dcmCore
@@ -164,11 +166,11 @@ flowchart TD
    `internal/serviceprovider` to create the resources. Placement returns `202`
    and `run_id` after policy succeeds and level 0 `create` has been initiated.
 
-5. internal/serviceprovider → External Service Provider (HTTP) For each instance
-   creation from placement, SPRM resolves the provider in the registry and
-   invokes the registered Service Provider over HTTP to perform create or
-   lifecycle and persists the service type instance in the control-plane
-   database
+5. internal/serviceprovider → Messaging System → Agent For each instance
+   creation from placement, SPRM looks up the agent in the Agent Registry and
+   publishes a creation CloudEvent to the agent's messaging topic. The Agent
+   routes the request to the appropriate Service Provider. SPRM persists the
+   service type instance in the control-plane database
 
 6. status consumer → placement The status consumer updates instance rows in the
    control-plane database and notifies placement (in-process) when a dependency
@@ -184,7 +186,7 @@ sequenceDiagram
   participant POL as Policy
   participant DB as Control-plane<br/> DB
   participant SPkg as SPRM
-  participant SP as Service Provider
+  participant MS as Messaging System
   participant NATS as Status Queue
 
   Dev->>CM: POST <br/>/api/v1alpha1/catalog-item-instances
@@ -206,19 +208,16 @@ sequenceDiagram
       PM->>DB: persist run + <br/>graph snapshot
         loop each DAG <br/>level-0 resource
           PM->>SPkg: ApplyCreate
-          SPkg->>SP: HTTP create
-          SP-->>SPkg: 202 PROVISIONING
+          SPkg->>MS: PUBLISH CloudEvent<br/>to agent topic
           SPkg->>DB: persist instance
         end
         PM-->>Dev: 202 run_id
-        SP-)NATS: status event
         NATS-)SPkg: status consumer
         SPkg->>DB: update instance Ready
         SPkg->>PM: OnResourceReady
         loop each resource <br/>at next DAG level
           PM->>SPkg: ApplyCreate
-          SPkg->>SP: HTTP create
-          SP-->>SPkg: 202 PROVISIONING
+          SPkg->>MS: PUBLISH CloudEvent<br/>to agent topic
           SPkg->>DB: persist instance
         end
     end
@@ -244,11 +243,12 @@ sequenceDiagram
    deny, return `PolicyRejected` with aggregated violations and do not call
    SPRM.
 
-5. Placement → SPRM → Service Provider (level 0) For each resource at DAG level
-   0 (in parallel within the level when policy allows), placement calls SPRM.
-   SPRM resolves the provider, invokes HTTP create on the Service Provider, and
-   persists the instance row. Placement returns `202` and `run_id` after policy
-   succeeds and level-0 resources creation have been initiated.
+5. Placement → SPRM → Agent (level 0) For each resource at DAG level 0 (in
+   parallel within the level when policy allows), placement calls SPRM. SPRM
+   looks up the agent in the Agent Registry, publishes a creation CloudEvent to
+   the agent's messaging topic, and persists the instance row. Placement returns
+   `202` and `run_id` after policy succeeds and level-0 resources creation have
+   been initiated.
 
 6. Status-driven DAG progression (level 1 and above)  
    The SPRM status consumer receives events, updates instance state in the
@@ -312,9 +312,9 @@ Evaluation uses the existing per-resource engine API.
    needed for mutation/defaulting.
 2. Placement loops over every resource in the resolved graph at admission and
    calls evaluate once per resource. All must return APPROVED or MODIFIED with a
-   selected provider before any SPRM `create`.
-3. Output per resource: allow or deny, optional spec mutation, selected
-   provider. Placement aggregates denials for the API response.
+   selected agent before any SPRM `create`.
+3. Output per resource: allow or deny, optional spec mutation, selected agent.
+   Placement aggregates denials for the API response.
 
 ### Risks and Mitigations
 
