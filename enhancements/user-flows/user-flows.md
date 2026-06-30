@@ -667,9 +667,11 @@ Three health states:
 ```mermaid
 sequenceDiagram
     participant AG as Agent
-    participant SP as Service Provider
+    participant SP as External SP
 
-    loop Every {healthCheckInterval} seconds
+    Note over AG: Embedded SPs: health<br/>checked in-process<br/>(no network call)
+
+    loop Every {healthCheckInterval} seconds (external SPs only)
         AG->>SP: GET /health
         alt 200 OK, status: healthy
             SP-->>AG: {status: "healthy"}

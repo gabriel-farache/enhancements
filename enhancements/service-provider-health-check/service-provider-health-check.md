@@ -11,7 +11,7 @@ reviewers:
   - "@pkliczewski"
   - "@gabriel-farache"
 approvers:
-  - ""
+  - TBD
 creation-date: 2025-12-15
 see-also:
   - "/enhancements/environment-agent/environment-agent.md"
@@ -168,11 +168,6 @@ The Agent self-reports the number of pending messages on its topic as
   **Congested** and stops routing new requests to it.
 - When `consumerLag` drops below the threshold on a subsequent heartbeat, DCM
   clears the Congested state.
-
-> **Note:** The environment-agent enhancement currently defines the heartbeat
-> payload as `{timestamp}` only. The extended payload `{timestamp, consumerLag}`
-> is defined here as the intended contract; the agent doc will be updated in a
-> follow-up.
 
 ## Agent Health State Summary
 
