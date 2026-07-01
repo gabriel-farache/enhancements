@@ -103,7 +103,8 @@ flowchart TD
 
 - Sends requests for validation via
   `POST /api/v1alpha1/policies:evaluateRequest`
-- Provides `available_agents` metadata in the evaluation request
+- Provides `available_agents` metadata as input in the evaluation request
+  payload
 - Optionally includes `exclude_agents` to exclude agents from consideration
   (e.g., after a queued-request timeout)
 - Receives validated/mutated payload and selected Agent (`agentName`)
