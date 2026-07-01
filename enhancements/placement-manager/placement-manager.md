@@ -452,7 +452,7 @@ sequenceDiagram
 - SP Resource Manager publishes the request to the agent's messaging topic
 - SPRM always responds synchronously with one of:
   - **SPRM returns error (404/503)**: Error response returned to Placement
-    Manager. Records deleted from Placement DB. Placement Manager forwards the
+    Manager. The record is deleted from Placement DB. Placement Manager forwards the
     error to Catalog Manager. Request processing stops.
   - **SPRM returns 202 Accepted**: Instance creation is in progress. Placement
     Manager returns 201 Created to Catalog Manager with a full `Resource`
