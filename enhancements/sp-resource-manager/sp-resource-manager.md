@@ -348,8 +348,10 @@ sequenceDiagram
 > creation request and the cancellation DELETE are present, they cancel out (see
 > [Environment Agent — Retry Topic](../environment-agent/environment-agent.md#retry-topic)).
 > For **queued deletion requests**, re-routing to a different agent is not
-> possible because the resource exists on the original agent's SP. PM waits for
-> the SP to recover or returns an error on timeout.
+> possible because the resource exists on the original agent's SP. The deletion
+> request remains in the Agent's retry topic and is processed automatically when
+> the SP recovers, or rejected if the SP becomes Unavailable (see
+> [Environment Agent — Retry Topic](../environment-agent/environment-agent.md#retry-topic)).
 
 ### Asynchronous Response Processing
 

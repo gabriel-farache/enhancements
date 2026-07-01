@@ -1174,9 +1174,16 @@ sequenceDiagram
         SPRM->>SPRM: Update instance: QUEUED
         SPRM->>PM: Notify: deletion QUEUED
 
-        Note over PM: Start queuedRequestTimeout.<br/>Deletion cannot be re-routed<br/>to a different agent.
-        alt queuedRequestTimeout expires
-            PM-->>CM: Error: deletion failed<br/>(agent SP unavailable)
+        Note over PM: Resource stays DELETING.<br/>Deletion cannot be re-routed.<br/>Agent holds the request in its<br/>retry topic for automatic resolution.
+
+        alt SP recovers — Agent processes held deletion
+            AG->>SP: DELETE {spEndpoint}/api/v1/{serviceType}/{resourceId}
+            SP-->>AG: {status: DELETING}
+            AG->>MS: PUBLISH CloudEvent<br/>{resourceId, status: DELETING}
+        else SP becomes Unavailable — Agent rejects
+            AG->>MS: PUBLISH CloudEvent<br/>{resourceId, error: "SP unavailable"}
+            MS->>SPRM: Deliver error
+            Note over SPRM: Enqueue in cleanup queue<br/>for deferred retry.<br/>Resource stays DELETING.
         end
     end
 

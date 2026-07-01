@@ -452,8 +452,8 @@ sequenceDiagram
 - SP Resource Manager publishes the request to the agent's messaging topic
 - SPRM always responds synchronously with one of:
   - **SPRM returns error (404/503)**: Error response returned to Placement
-    Manager. The record is deleted from Placement DB. Placement Manager forwards the
-    error to Catalog Manager. Request processing stops.
+    Manager. The record is deleted from Placement DB. Placement Manager forwards
+    the error to Catalog Manager. Request processing stops.
   - **SPRM returns 202 Accepted**: Instance creation is in progress. Placement
     Manager returns 201 Created to Catalog Manager with a full `Resource`
     object. The resource is now in a `PENDING` state.
@@ -510,10 +510,13 @@ sequenceDiagram
 
     opt SPRM notifies PM of QUEUED status
         SPRM->>PM: Notify: deletion QUEUED<br/>{instanceId, agentName}
-        Note over PM: Wait for SP to recover.<br/>Deletion cannot be re-routed<br/>to a different agent.
-        alt queuedRequestTimeout expires
-            PM-->>CM: Error: deletion failed<br/>(agent SP unavailable)
-        end
+        Note over PM: Resource stays DELETING.<br/>Deletion cannot be re-routed<br/>to a different agent.<br/>The Agent holds the request in<br/>its retry topic and will process<br/>it when the SP recovers.
+    end
+
+    alt Agent reports SP recovered — deletion processed
+        SPRM->>PM: Notify: deletion acknowledged<br/>{instanceId, status: DELETING}
+    else Agent reports SP Unavailable — deletion rejected
+        Note over SPRM: SPRM enqueues the deletion<br/>in the cleanup queue for<br/>deferred retry.<br/>Resource stays DELETING.
     end
     deactivate PM
 ```
@@ -544,15 +547,27 @@ sequenceDiagram
   asynchronously notify PM of a `QUEUED` status if the Agent reports the SP for
   the service type is unhealthy. Unlike creation, deletion cannot be re-routed
   to a different agent because the resource exists on the original agent's SP.
-  PM waits up to `queuedRequestTimeout` for the SP to recover. If the timeout
-  expires, PM returns an error to Catalog Manager. The user may retry the
-  deletion later.
+  The resource status at the PM level remains `DELETING` — the QUEUED state is
+  an SPRM-level concern, not a PM resource status change. PM relies on the
+  Agent's retry topic to resolve the deletion automatically: when the SP
+  recovers, the Agent processes the held deletion request and reports success.
+  If the SP transitions to Unavailable, the Agent rejects the held request with
+  an error CloudEvent. SPRM then enqueues the deletion in its cleanup queue for
+  deferred retry rather than marking the resource as failed (see
+  [Rehydration Flow — Cleanup Mechanism](../rehydration-flow/rehydration-flow.md#cleanup-mechanism)).
+  The cleanup scheduler retries the deletion once the Agent re-advertises the
+  service type. If the retry fails (e.g., the service type is now served by a
+  different SP that has no knowledge of the resource), the resource is
+  considered deleted. If the Agent itself is no longer registered, the resource
+  is also considered deleted since the underlying environment is presumed
+  decommissioned. PM does not apply `queuedRequestTimeout` for deletions because
+  the Agent retry topic and SPRM cleanup queue provide automatic resolution.
 
 ### Configuration
 
-| Parameter              | Type     | Default | Description                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `queuedRequestTimeout` | Duration | `300s`  | Maximum time PM waits when SPRM reports a "queued" status. For **creation** requests: on expiry, PM cancels the request and re-evaluates policies excluding the current agent. When set to `0`, PM immediately re-evaluates without waiting. For **deletion** requests: on expiry, PM returns an error to Catalog Manager (deletion cannot be re-routed to a different agent). |
+| Parameter              | Type     | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queuedRequestTimeout` | Duration | `300s`  | Maximum time PM waits when SPRM reports a "queued" status for **creation** requests. On expiry, PM cancels the request and re-evaluates policies excluding the current agent. When set to `0`, PM immediately re-evaluates without waiting. This timeout does **not** apply to deletion requests — deletions rely on the Agent's retry topic for automatic resolution (see [Service Deletion Flow](#service-deletion-flow)). |
 
 ### Key Characteristics/Notes
 
@@ -563,18 +578,19 @@ sequenceDiagram
 - **Agent-Based Selection**: Service Provider selection is no longer a direct
   concern of the Placement Manager. The Policy Engine selects an Agent based on
   environment, service types, and cost. The Agent internally selects the SP.
-- **Queued-Request Timeout**: When SPRM reports a "queued" status (the SP for
-  the requested service type on the agent is unhealthy), PM applies a
-  configurable timeout. For creation requests, on expiry PM cancels the request
-  and re-evaluates policies excluding the timed-out agent. For deletion
-  requests, on expiry PM returns an error (deletion cannot be re-routed to a
-  different agent).
+- **Queued-Request Handling**: When SPRM reports a "queued" status (the SP for
+  the requested service type on the agent is unhealthy), PM differentiates by
+  request type. For creation requests, PM applies `queuedRequestTimeout`: on
+  expiry, PM cancels the request and re-evaluates policies excluding the
+  timed-out agent. For deletion requests, PM does not apply a timeout — instead,
+  it relies on the Agent's retry topic to resolve the deletion automatically
+  when the SP recovers or reject it if the SP becomes Unavailable.
 - **Error Handling**: Clear error paths for policy rejections, instance creation
   failures, and queued-request timeouts
 - **State Management**: Both original intent and validated request are stored
   for complete request lifecycle tracking and rehydration purposes
 
-### Next Steps
+### Future Improvements
 
 - Per-agent timeout overrides (allow different `queuedRequestTimeout` values per
   agent)
