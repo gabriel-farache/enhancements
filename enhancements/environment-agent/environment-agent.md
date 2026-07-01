@@ -1239,6 +1239,33 @@ environment variable polling, or Kubernetes ConfigMap updates — and propagate
 them to DCM without downtime. Referenced in [Open Questions](#open-questions)
 (item 2).
 
+### Agent-Declared Congestion Threshold
+
+The current congestion mechanism relies on a single global
+`consumerLagThreshold` set by DCM and applied uniformly to all agents. This
+works as a baseline quality-of-service control but does not account for
+heterogeneous agent capacities — an edge agent with limited resources may become
+overloaded well before reaching a threshold that is comfortable for a
+well-provisioned datacenter agent. A future iteration would allow each agent to
+declare its own congestion threshold, reflecting its actual processing capacity.
+
+Two approaches are worth exploring:
+
+- **Agent-provided threshold:** The agent includes a `congestionThreshold` field
+  in the heartbeat (or at registration time). DCM uses this value instead of the
+  global threshold when evaluating that agent's `consumerLag`. DCM remains the
+  decision-maker.
+- **Agent self-declaration:** The agent directly reports a `congested` flag in
+  the heartbeat. DCM trusts the agent's own assessment of its capacity without
+  performing a comparison. This gives the agent full autonomy over congestion
+  signaling but reduces DCM's ability to enforce uniform QoS.
+
+Design considerations include: whether the global threshold acts as a
+floor/ceiling even when a per-agent value is present, how to prevent
+misconfigured agents from never declaring congestion, and whether the threshold
+should be static (set at registration) or dynamic (updated in each heartbeat as
+conditions change).
+
 ### Multiple SPs per Service Type (consolidation)
 
 The current design enforces a one-SP-per-service-type constraint. A future
