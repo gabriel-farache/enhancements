@@ -1210,25 +1210,6 @@ agents, and behaviour under network partitions. This is deferred to a future
 iteration when the trade-offs are better understood and the maturity level of a
 DCM-native watch system can be assessed.
 
-## Cross-Cutting Impact
-
-The following enhancement documents will need to be updated to reflect the
-changes introduced by this enhancement. These updates will be done in subsequent
-PRs.
-
-| Document                                                                                           | Impact                                                                                                                                                                                                                                                                      |
-| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [SP Registration Flow](../sp-registration-flow/sp-registration-flow.md)                            | External SPs register to the agent instead of DCM. The existing registration API contract remains valid for the agent's REST API, but DCM's registration handler no longer receives SP registrations directly. Embedded SPs register internally and do not use this flow.   |
-| [Service Provider Health Check](../service-provider-health-check/service-provider-health-check.md) | Health polling responsibility shifts from DCM to the agent. DCM monitors agent health via heartbeats instead of polling individual SPs.                                                                                                                                     |
-| [SP Resource Manager](../sp-resource-manager/sp-resource-manager.md)                               | SPRM publishes creation requests to the agent's bus topic instead of calling SP REST endpoints directly. SPRM interacts with the agent (not individual SPs) for health status. From SPRM's perspective, the agent serves the same role as a SP: provisioning service types. |
-| [Placement Manager](../placement-manager/placement-manager.md)                                     | Policy evaluation may now include environment as a selection criterion. Placement Manager delegates to SPRM, which routes through the messaging system.                                                                                                                     |
-| [User Flows](../user-flows/user-flows.md)                                                          | End-to-end flows must include the agent layer between DCM and SPs.                                                                                                                                                                                                          |
-
-DCM monitors consumer lag on agent topics via the `consumerLag` field in each
-heartbeat (see [Agent Health](#agent-health)). When lag exceeds
-`consumerLagThreshold`, DCM marks the agent as **Congested** and stops routing
-new requests to it.
-
 ## Future Enhancements
 
 This section lists potential enhancements to the environment agent that are out
